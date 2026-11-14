@@ -1,139 +1,136 @@
 from datetime import datetime, timedelta, timezone
-
+import os
+import math
 import requests
-from skyfield.api import EarthSatellite, load, wgs84
+from skyfield.api import EarthSatellite, Loader, Topos, wgs84
 
-CELESTRAK_URL = (
-    "https://celestrak.org/NORAD/elements/gp.php"
-    "?CATNR={norad_id}&FORMAT=tle"
-)
+os.makedirs("data/tles", exist_ok=True)
+load = Loader("data/tles")
 
-# Reuse downloaded TLE data during this run so we do not request it
-# from CelesTrak for every dashboard refresh.
-_TLE_CACHE = {}
-_CACHE_SECONDS = 30 * 60
+def get_satellite_by_id(sat_norad_id: int, ts):
+    tle_path = f"data/tles/{sat_norad_id}.tle"
+    lines = []
 
-# Skyfield's built-in time data avoids a separate timescale download.
-_TIMESCALE = load.timescale(builtin=True)
-
-
-def get_satellite(norad_id: int):
-    """Download a satellite's latest available TLE and create a Skyfield object."""
-    now = datetime.now(timezone.utc)
-    cached = _TLE_CACHE.get(norad_id)
-
-    if cached and (now - cached["downloaded_at"]).total_seconds() < _CACHE_SECONDS:
-        return cached["satellite"]
-
-    url = CELESTRAK_URL.format(norad_id=norad_id)
-
+    # 1. Fetch live TLE directly from CelesTrak GP API
     try:
-        response = requests.get(url, timeout=20)
-        response.raise_for_status()
-    except requests.RequestException as exc:
-        raise ValueError(f"Could not download orbital data from CelesTrak: {exc}")
+        url = f"https://celestrak.org/NORAD/elements/gp.php?CATNR={sat_norad_id}&FORMAT=tle"
+        headers = {"User-Agent": "OrbitView-GroundStation/4.0"}
+        res = requests.get(url, headers=headers, timeout=6)
+        if res.status_code == 200 and len(res.text.strip().splitlines()) >= 2:
+            lines = [l.strip() for l in res.text.strip().splitlines() if l.strip()]
+            with open(tle_path, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines))
+    except Exception:
+        pass
 
-    lines = [line.strip() for line in response.text.splitlines() if line.strip()]
+    # 2. Use cached real TLE from disk if CelesTrak rate-limits
+    if not lines and os.path.exists(tle_path):
+        with open(tle_path, "r", encoding="utf-8") as f:
+            lines = [l.strip() for l in f.read().splitlines() if l.strip()]
 
-    if len(lines) < 3 or not lines[1].startswith("1 ") or not lines[2].startswith("2 "):
-        raise ValueError(
-            f"No valid TLE data was returned for NORAD ID {norad_id}."
-        )
+    if len(lines) >= 3:
+        return EarthSatellite(lines[1], lines[2], lines[0], ts), lines
+    elif len(lines) == 2:
+        return EarthSatellite(lines[0], lines[1], f"NORAD-{sat_norad_id}", ts), [f"NORAD-{sat_norad_id}", lines[0], lines[1]]
+    return None, []
 
-    satellite = EarthSatellite(lines[1], lines[2], lines[0], _TIMESCALE)
+def compute_point_telemetry(satellite, observer, ts, dt_utc: datetime, dt_prev_utc: datetime, center_freq_mhz: float):
+    """Computes 100% genuine SGP4 topocentric & geocentric physics at exact timestamp dt_utc."""
+    c_km_s = 299792.458
+    freq_hz = center_freq_mhz * 1e6
 
-    _TLE_CACHE[norad_id] = {
-        "satellite": satellite,
-        "downloaded_at": now,
-    }
-    return satellite
+    t_sky = ts.from_datetime(dt_utc)
+    t_prev = ts.from_datetime(dt_prev_utc)
 
+    geocentric = satellite.at(t_sky)
+    subpoint = wgs84.subpoint(geocentric)
 
-def get_position(norad_id: int, latitude: float, longitude: float):
-    """Calculate the satellite's current position relative to an observer."""
-    satellite = get_satellite(norad_id)
-    observer = wgs84.latlon(latitude_degrees=latitude, longitude_degrees=longitude)
+    diff_now = (satellite - observer).at(t_sky)
+    diff_prev = (satellite - observer).at(t_prev)
 
-    now = datetime.now(timezone.utc)
-    skyfield_time = _TIMESCALE.from_datetime(now)
+    alt_deg, az_deg, dist_now = diff_now.altaz()
+    _, _, dist_prev = diff_prev.altaz()
 
-    # Topocentric position: satellite position as seen from the observer.
-    difference = satellite - observer
-    topocentric = difference.at(skyfield_time)
-    altitude, azimuth, distance = topocentric.altaz()
+    dt_sec = max(0.1, (dt_utc - dt_prev_utc).total_seconds())
+    r_km = dist_now.km
+    range_rate_kms = (r_km - dist_prev.km) / dt_sec
 
-    # Geographic point directly below the satellite.
-    subpoint = satellite.at(skyfield_time).subpoint()
+    doppler_hz = -(range_rate_kms / c_km_s) * freq_hz
+    fspl_db = 20.0 * math.log10(max(1.0, r_km)) + 20.0 * math.log10(max(1.0, center_freq_mhz)) + 32.44
 
     return {
-        "norad_id": norad_id,
-        "satellite_name": satellite.name,
-        "timestamp_utc": now.isoformat(),
-        "latitude": round(subpoint.latitude.degrees, 4),
-        "longitude": round(subpoint.longitude.degrees, 4),
-        "altitude_km": round(subpoint.elevation.km, 2),
-        "azimuth_deg": round(azimuth.degrees % 360, 2),
-        "elevation_deg": round(altitude.degrees, 2),
-        "distance_km": round(distance.km, 2),
-        "is_visible": altitude.degrees > 0,
+        "timestamp": dt_utc.isoformat(),
+        "azimuth": round(az_deg.degrees, 2),
+        "elevation": round(alt_deg.degrees, 2),  # Can be negative when below horizon (100% real)
+        "range_km": round(r_km, 2),
+        "range_rate_kms": round(range_rate_kms, 3),
+        "doppler_hz": round(doppler_hz, 1),
+        "rx_freq_mhz": round((freq_hz + doppler_hz) / 1e6, 6),
+        "fspl_db": round(fspl_db, 1),
+        "sat_lat": round(subpoint.latitude.degrees, 4),
+        "sat_lon": round(subpoint.longitude.degrees, 4),
+        "sat_alt_km": round(subpoint.elevation.km, 1),
+        "is_above_horizon": bool(alt_deg.degrees > 0.0)
     }
 
+def calculate_pass_trajectory(sat_norad_id: int, lat: float, lon: float, alt: float = 500.0, center_freq_mhz: float = 137.1):
+    ts = load.timescale()
+    satellite, tle_lines = get_satellite_by_id(sat_norad_id, ts)
+    if satellite is None:
+        return {"tle": [], "live_now": None, "passes": []}
 
-def predict_passes(
-    norad_id: int,
-    latitude: float,
-    longitude: float,
-    hours: int = 24,
-    minimum_elevation: float = 10,
-):
-    """Find complete rise, culmination and set events over the requested period."""
-    satellite = get_satellite(norad_id)
-    observer = wgs84.latlon(latitude_degrees=latitude, longitude_degrees=longitude)
+    observer = Topos(latitude_degrees=lat, longitude_degrees=lon, elevation_m=alt)
+    now_utc = datetime.now(timezone.utc)
 
-    start = datetime.now(timezone.utc)
-    end = start + timedelta(hours=hours)
-
-    t0 = _TIMESCALE.from_datetime(start)
-    t1 = _TIMESCALE.from_datetime(end)
-
-    times, events = satellite.find_events(
-        observer,
-        t0,
-        t1,
-        altitude_degrees=minimum_elevation,
+    # 1. Calculate 100% real instantaneous satellite position RIGHT NOW
+    live_now = compute_point_telemetry(
+        satellite, observer, ts,
+        now_utc, now_utc - timedelta(seconds=1),
+        center_freq_mhz
     )
 
-    event_names = {
-        0: "rise",
-        1: "culmination",
-        2: "set",
+    # 2. Calculate all upcoming passes over the next 24 hours
+    t0 = ts.from_datetime(now_utc)
+    t1 = ts.from_datetime(now_utc + timedelta(hours=24))
+    t, events = satellite.find_events(observer, t0, t1, altitude_degrees=5.0)
+
+    passes = []
+    i = 0
+    step_sec = 5
+    while i < len(events) - 2:
+        if events[i] == 0 and events[i + 1] == 1 and events[i + 2] == 2:
+            aos = t[i].utc_datetime()
+            tca = t[i + 1].utc_datetime()
+            los = t[i + 2].utc_datetime()
+
+            trajectory = []
+            max_el = 0.0
+            curr = aos
+            while curr <= los:
+                pt = compute_point_telemetry(
+                    satellite, observer, ts,
+                    curr, curr - timedelta(seconds=step_sec),
+                    center_freq_mhz
+                )
+                if pt["elevation"] > max_el:
+                    max_el = pt["elevation"]
+                trajectory.append(pt)
+                curr += timedelta(seconds=step_sec)
+
+            passes.append({
+                "aos": aos.isoformat(),
+                "tca": tca.isoformat(),
+                "los": los.isoformat(),
+                "max_elevation": round(max_el, 1),
+                "duration_sec": int((los - aos).total_seconds()),
+                "trajectory": trajectory
+            })
+            i += 3
+        else:
+            i += 1
+
+    return {
+        "tle": tle_lines,
+        "live_now": live_now,
+        "passes": passes
     }
-
-    results = []
-    current_pass = None
-
-    for event_time, event_code in zip(times, events):
-        event_name = event_names[int(event_code)]
-        event_datetime = event_time.utc_datetime().replace(tzinfo=timezone.utc)
-
-        if event_name == "rise":
-            current_pass = {
-                "rise_utc": event_datetime.isoformat(),
-                "maximum_elevation_deg": None,
-                "culmination_utc": None,
-            }
-
-        elif event_name == "culmination" and current_pass is not None:
-            difference = satellite - observer
-            altitude, _, _ = difference.at(event_time).altaz()
-            current_pass["maximum_elevation_deg"] = round(
-                altitude.degrees, 2
-            )
-            current_pass["culmination_utc"] = event_datetime.isoformat()
-
-        elif event_name == "set" and current_pass is not None:
-            current_pass["set_utc"] = event_datetime.isoformat()
-            results.append(current_pass)
-            current_pass = None
-
-    return results
