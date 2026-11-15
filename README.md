@@ -9,7 +9,7 @@ Software-based satellite tracking and weather-image visualization dashboard.
 - NOAA APT weather-image decoding
 
 ## Technology stack
-- Frontend: 
+- Frontend: React and vite
 - Backend: Python and FastAPI
 - Satellite data: CelesTrak and SatNOGS
 
