@@ -7,32 +7,82 @@ from skyfield.api import EarthSatellite, Loader, Topos, wgs84
 os.makedirs("data/tles", exist_ok=True)
 load = Loader("data/tles")
 
+
 def get_satellite_by_id(sat_norad_id: int, ts):
+    import requests
+
     tle_path = f"data/tles/{sat_norad_id}.tle"
     lines = []
 
-    # 1. Fetch live TLE directly from CelesTrak GP API
+    # 1. Try CelesTrak first
     try:
-        url = f"https://celestrak.org/NORAD/elements/gp.php?CATNR={sat_norad_id}&FORMAT=tle"
-        headers = {"User-Agent": "OrbitView-GroundStation/4.0"}
-        res = requests.get(url, headers=headers, timeout=6)
-        if res.status_code == 200 and len(res.text.strip().splitlines()) >= 2:
-            lines = [l.strip() for l in res.text.strip().splitlines() if l.strip()]
-            with open(tle_path, "w", encoding="utf-8") as f:
-                f.write("\n".join(lines))
-    except Exception:
-        pass
+        url = (
+            f"https://celestrak.org/NORAD/elements/"
+            f"gp.php?CATNR={sat_norad_id}&FORMAT=tle"
+        )
+        response = requests.get(url, timeout=8)
+        response.raise_for_status()
 
-    # 2. Use cached real TLE from disk if CelesTrak rate-limits
+        fetched = [
+            line.strip()
+            for line in response.text.splitlines()
+            if line.strip()
+        ]
+
+        if len(fetched) >= 3 and fetched[1].startswith("1 ") and fetched[2].startswith("2 "):
+            lines = fetched[:3]
+        elif len(fetched) >= 2 and fetched[0].startswith("1 ") and fetched[1].startswith("2 "):
+            lines = [f"NORAD-{sat_norad_id}", fetched[0], fetched[1]]
+
+    except requests.RequestException as e:
+        print(f"CelesTrak unavailable: {e}")
+
+    # 2. If CelesTrak fails, try SatNOGS
+    if not lines:
+        try:
+            url = (
+                "https://db.satnogs.org/api/tle/"
+                f"?satellite__norad_cat_id={sat_norad_id}"
+            )
+            response = requests.get(url, timeout=15)
+            response.raise_for_status()
+
+            records = response.json()
+
+            for record in records:
+                if record.get("norad_cat_id") == sat_norad_id:
+                    line1 = record.get("tle1", "").strip()
+                    line2 = record.get("tle2", "").strip()
+                    name = record.get("tle0", f"NORAD-{sat_norad_id}")
+
+                    if line1.startswith("1 ") and line2.startswith("2 "):
+                        lines = [name, line1, line2]
+                        break
+
+        except (requests.RequestException, ValueError) as e:
+            print(f"SatNOGS unavailable: {e}")
+
+    # 3. Save newly fetched TLE
+    if lines:
+        os.makedirs(os.path.dirname(tle_path), exist_ok=True)
+        with open(tle_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines))
+
+    # 4. Fall back to cached TLE
     if not lines and os.path.exists(tle_path):
         with open(tle_path, "r", encoding="utf-8") as f:
-            lines = [l.strip() for l in f.read().splitlines() if l.strip()]
+            lines = [line.strip() for line in f if line.strip()]
 
+    # 5. Create Skyfield satellite object
     if len(lines) >= 3:
-        return EarthSatellite(lines[1], lines[2], lines[0], ts), lines
+        return EarthSatellite(lines[1], lines[2], lines[0], ts),lines
     elif len(lines) == 2:
-        return EarthSatellite(lines[0], lines[1], f"NORAD-{sat_norad_id}", ts), [f"NORAD-{sat_norad_id}", lines[0], lines[1]]
+        return EarthSatellite(
+            lines[0], lines[1], f"NORAD-{sat_norad_id}", ts
+        ), [f"NORAD-{sat_norad_id}", lines[0], lines[1]]
+
     return None, []
+
 
 def compute_point_telemetry(satellite, observer, ts, dt_utc: datetime, dt_prev_utc: datetime, center_freq_mhz: float):
     """Computes 100% genuine SGP4 topocentric & geocentric physics at exact timestamp dt_utc."""
