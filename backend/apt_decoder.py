@@ -1,328 +1,550 @@
 import os
 import io
+import math
+import glob
+import shutil
+import subprocess
 from datetime import datetime, timezone, timedelta
 import requests
-import numpy as np
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageOps, ImageEnhance, ImageFont, ImageFilter
 
-IMAGING_SATELLITE_NORADS = {
-    33591: "NOAA 19 (AVHRR/3 6-Channel Imager)",
-    28654: "NOAA 18 (AVHRR/3 6-Channel Imager)",
-    25338: "NOAA 15 (AVHRR/3 6-Channel Imager)",
-    57166: "METEOR-M2 3 (MSU-MR Multispectral Imager)",
-    59051: "METEOR-M2 4 (MSU-MR Multispectral Imager)",
-    49260: "LANDSAT 9 (OLI-2 & TIRS-2 Imager)",
-    40697: "SENTINEL-2A (MSI 13-Band Imager)",
-    39086: "SARAL (AltiKa Oceanographic Payload)",
-    25994: "TERRA / EOS AM-1 (MODIS 36-Band Radiometer)"
+IMAGE_DIR = "data/images"
+AUDIO_DIR = "data/audio"
+SATDUMP_WORK_DIR = "data/satdump_out"
+
+os.makedirs(IMAGE_DIR, exist_ok=True)
+os.makedirs(AUDIO_DIR, exist_ok=True)
+os.makedirs(SATDUMP_WORK_DIR, exist_ok=True)
+
+SATDUMP_PATHS = [
+    "satdump",
+    r"C:\Program Files\SatDump\bin\satdump.exe",
+    r"C:\SatDump\satdump.exe"
+]
+
+IMAGING_SATELLITES = {
+    33591: {
+        "name": "NOAA 19",
+        "noaa_num": "19",
+        "sensor": "AVHRR/3 APT",
+        "band_a": "CH-A: VISIBLE (0.86 um)",
+        "band_b": "CH-B: THERMAL IR (10.8 um)",
+        "equator_ist": "14:15 IST (08:45 UTC)",
+        "lat_span": 8.5,
+        "lon_span": 12.5,
+        "vis_gain": 1.08,
+        "ir_contrast": 1.12
+    },
+    28654: {
+        "name": "NOAA 18",
+        "noaa_num": "18",
+        "sensor": "AVHRR/3 APT",
+        "band_a": "CH-A: VISIBLE (0.86 um)",
+        "band_b": "CH-B: THERMAL IR (10.8 um)",
+        "equator_ist": "10:30 IST (05:00 UTC)",
+        "lat_span": 8.5,
+        "lon_span": 12.5,
+        "vis_gain": 1.05,
+        "ir_contrast": 1.10
+    },
+    25338: {
+        "name": "NOAA 15",
+        "noaa_num": "15",
+        "sensor": "AVHRR/3 APT",
+        "band_a": "CH-A: VISIBLE (0.86 um)",
+        "band_b": "CH-B: THERMAL IR (10.8 um)",
+        "equator_ist": "07:45 IST (02:15 UTC)",
+        "lat_span": 8.5,
+        "lon_span": 12.5,
+        "vis_gain": 1.02,
+        "ir_contrast": 1.15
+    },
+    57166: {
+        "name": "METEOR-M2 3",
+        "noaa_num": None,
+        "sensor": "MSU-MR LRPT",
+        "band_a": "CH-A: VIS / NEAR-IR (0.6 um)",
+        "band_b": "CH-B: THERMAL IR (11.5 um)",
+        "equator_ist": "09:30 IST (04:00 UTC)",
+        "lat_span": 8.0,
+        "lon_span": 12.0,
+        "vis_gain": 1.12,
+        "ir_contrast": 1.14
+    },
+    59051: {
+        "name": "METEOR-M2 4",
+        "noaa_num": None,
+        "sensor": "MSU-MR LRPT",
+        "band_a": "CH-A: VIS / NEAR-IR (0.6 um)",
+        "band_b": "CH-B: THERMAL IR (11.5 um)",
+        "equator_ist": "10:15 IST (04:45 UTC)",
+        "lat_span": 8.0,
+        "lon_span": 12.0,
+        "vis_gain": 1.14,
+        "ir_contrast": 1.14
+    },
+    25994: {
+        "name": "TERRA (EOS AM-1)",
+        "noaa_num": None,
+        "sensor": "MODIS 36-Band",
+        "band_a": "CH-A: MODIS TRUE COLOR",
+        "band_b": "CH-B: BAND 31 IR (11.0 um)",
+        "equator_ist": "10:30 IST (05:00 UTC)",
+        "lat_span": 7.5,
+        "lon_span": 11.0,
+        "vis_gain": 1.10,
+        "ir_contrast": 1.18
+    },
+    49260: {
+        "name": "LANDSAT 9",
+        "noaa_num": None,
+        "sensor": "OLI-2 / TIRS-2",
+        "band_a": "CH-A: OLI-2 SWATH",
+        "band_b": "CH-B: TIRS-2 IR (10.9 um)",
+        "equator_ist": "10:00 IST (04:30 UTC)",
+        "lat_span": 5.0,
+        "lon_span": 7.0,
+        "vis_gain": 1.12,
+        "ir_contrast": 1.18
+    },
+    40697: {
+        "name": "SENTINEL-2A",
+        "noaa_num": None,
+        "sensor": "MSI 13-Band",
+        "band_a": "CH-A: MSI SWATH",
+        "band_b": "CH-B: THERMAL IR (10.8 um)",
+        "equator_ist": "10:30 IST (05:00 UTC)",
+        "lat_span": 5.5,
+        "lon_span": 7.5,
+        "vis_gain": 1.12,
+        "ir_contrast": 1.12
+    },
+    39086: {
+        "name": "SARAL (ISRO)",
+        "noaa_num": None,
+        "sensor": "AltiKa Ka-Band",
+        "band_a": "CH-A: VISIBLE SWATH",
+        "band_b": "CH-B: IR RADIOMETER",
+        "equator_ist": "18:00 IST (12:30 UTC)",
+        "lat_span": 6.5,
+        "lon_span": 9.0,
+        "vis_gain": 1.06,
+        "ir_contrast": 1.15
+    }
 }
 
-def get_font(size: int):
-    for font_name in ["consolab.ttf", "consola.ttf", "arialbd.ttf", "arial.ttf", "segoeui.ttf"]:
+
+def load_clean_font(size: int = 14):
+    for font_name in ("consolab.ttf", "consola.ttf", "arialbd.ttf", "arial.ttf", "segoeui.ttf"):
         try:
             return ImageFont.truetype(font_name, size)
         except Exception:
             continue
+    return ImageFont.load_default()
+
+
+def find_satdump_binary() -> str | None:
+    for candidate in SATDUMP_PATHS:
+        if shutil.which(candidate) or os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+def run_satdump_noaa_apt(audio_file: str, noaa_num: str) -> tuple[Image.Image | None, Image.Image | None]:
+    satdump_bin = find_satdump_binary()
+    if not satdump_bin or not os.path.isfile(audio_file):
+        return None, None
+
+    out_folder = os.path.join(SATDUMP_WORK_DIR, f"run_{int(datetime.now().timestamp())}")
+    os.makedirs(out_folder, exist_ok=True)
+    cmd = [satdump_bin, "noaa_apt", "audio", audio_file, out_folder, "--satellite_number", str(noaa_num)]
+
     try:
-        return ImageFont.load_default(size=size)
+        subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=45, check=False)
+        png_files = sorted(glob.glob(os.path.join(out_folder, "*.png")))
+        if len(png_files) >= 2:
+            img_a = Image.open(png_files[0]).convert("RGB").resize((850, 515), Image.Resampling.LANCZOS)
+            img_b = Image.open(png_files[1]).convert("RGB").resize((850, 515), Image.Resampling.LANCZOS)
+            return img_a, img_b
+        elif len(png_files) == 1:
+            full = Image.open(png_files[0]).convert("RGB")
+            w, h = full.size
+            img_a = full.crop((0, 0, w // 2, h)).resize((850, 515), Image.Resampling.LANCZOS)
+            img_b = full.crop((w // 2, 0, w, h)).resize((850, 515), Image.Resampling.LANCZOS)
+            return img_a, img_b
     except Exception:
-        return ImageFont.load_default()
+        pass
+    return None, None
 
-def format_dual_timestamps(raw_utc_str: str) -> tuple[str, str, str]:
-    dt_utc = datetime.now(timezone.utc)
-    if raw_utc_str:
-        try:
-            clean = raw_utc_str.replace(" UTC", "").replace("Z", "+00:00").strip()
-            dt_utc = datetime.fromisoformat(clean)
-            if dt_utc.tzinfo is None:
-                dt_utc = dt_utc.replace(tzinfo=timezone.utc)
-        except Exception:
-            pass
 
-    ist_tz = timezone(timedelta(hours=5, minutes=30))
-    dt_ist = dt_utc.astimezone(ist_tz)
+def get_solar_zenith_deg(lat: float, lon: float, dt_utc: datetime) -> float:
+    start_of_year = datetime(dt_utc.year, 1, 1, tzinfo=timezone.utc)
+    day_of_year = (dt_utc - start_of_year).total_seconds() / 86400.0
+    utc_hours = dt_utc.hour + dt_utc.minute / 60.0 + dt_utc.second / 3600.0
 
-    date_str = dt_utc.strftime("%d %b %Y").upper()
-    utc_str = dt_utc.strftime("%H:%M:%S UTC")
-    ist_str = dt_ist.strftime("%d %b %Y, %I:%M:%S %p IST")
-    return date_str, utc_str, ist_str
+    gamma = (2.0 * math.pi / 365.25) * (day_of_year - 81.0)
+    decl_rad = math.radians(23.44 * math.sin(gamma))
+    eq_time_min = 9.87 * math.sin(2 * gamma) - 7.53 * math.cos(gamma) - 1.5 * math.sin(gamma)
+    solar_time_hr = (utc_hours + lon / 15.0 + eq_time_min / 60.0) % 24.0
+    hour_angle_rad = math.radians((solar_time_hr - 12.0) * 15.0)
 
-def fetch_nasa_wmts_stitched_swath(
-    layer: str,
-    matrix_set: str,
-    ext: str,
+    lat_rad = math.radians(lat)
+    cos_zenith = (
+        math.sin(lat_rad) * math.sin(decl_rad)
+        + math.cos(lat_rad) * math.cos(decl_rad) * math.cos(hour_angle_rad)
+    )
+    cos_zenith = max(-1.0, min(1.0, cos_zenith))
+    return math.degrees(math.acos(cos_zenith))
+
+
+def analyze_cloud_coverage(vis_img: Image.Image) -> tuple[float, str]:
+    small = vis_img.resize((220, 140), Image.Resampling.BILINEAR)
+    r_ch, g_ch, b_ch = small.split()
+    r_px, g_px, b_px = r_ch.load(), g_ch.load(), b_ch.load()
+
+    total_px = small.width * small.height
+    cloud_px = 0
+
+    for y in range(small.height):
+        for x in range(small.width):
+            rv, gv, bv = r_px[x, y], g_px[x, y], b_px[x, y]
+            lum = 0.299 * rv + 0.587 * gv + 0.114 * bv
+            sat = max(rv, gv, bv) - min(rv, gv, bv)
+            if (lum > 125 and sat < 55) or (lum > 165 and sat < 75):
+                cloud_px += 1
+
+    pct = round((cloud_px / float(total_px)) * 100.0, 1)
+    if pct >= 60.0:
+        desc = f"{pct}% (Heavy Synoptic Cloud Deck)"
+    elif pct >= 25.0:
+        desc = f"{pct}% (Scattered Convective Clouds)"
+    elif pct >= 8.0:
+        desc = f"{pct}% (Light Coastal / Cirrus Clouds)"
+    else:
+        desc = f"{pct}% (Mostly Clear Sky)"
+    return pct, desc
+
+
+def is_mostly_blank_or_dark(img: Image.Image) -> bool:
+    gray = img.convert("L")
+    hist = gray.histogram()
+    total = float(img.width * img.height)
+    very_dark = sum(hist[:22]) / total
+    mean_val = sum(i * hist[i] for i in range(256)) / total
+    return very_dark > 0.65 or mean_val < 18.0
+
+
+def fetch_gibs_layer(
+    wms_url: str,
+    layers: str,
+    min_lat: float,
+    min_lon: float,
+    max_lat: float,
+    max_lon: float,
     date_str: str,
-    lat: float,
-    lon: float,
-    out_w: int,
-    out_h: int,
-    session: requests.Session
-) -> Image.Image:
-    z = 3
-    tile_deg = 288.0 / (2 ** z)  # 36.0 degrees per 512px tile
+    headers: dict
+) -> Image.Image | None:
+    bbox_130 = f"{min_lat:.4f},{min_lon:.4f},{max_lat:.4f},{max_lon:.4f}"
+    params = {
+        "SERVICE": "WMS",
+        "VERSION": "1.3.0",
+        "REQUEST": "GetMap",
+        "LAYERS": layers,
+        "STYLES": "",
+        "CRS": "EPSG:4326",
+        "BBOX": bbox_130,
+        "WIDTH": "850",
+        "HEIGHT": "515",
+        "FORMAT": "image/jpeg",
+        "TIME": date_str
+    }
+    try:
+        r = requests.get(wms_url, params=params, headers=headers, timeout=10)
+        if r.status_code == 200 and "image" in r.headers.get("Content-Type", "").lower() and len(r.content) > 2000:
+            candidate = Image.open(io.BytesIO(r.content)).convert("RGB").resize((850, 515), Image.Resampling.LANCZOS)
+            if not is_mostly_blank_or_dark(candidate):
+                return candidate
+    except Exception:
+        pass
+    return None
 
-    exact_col = (lon + 180.0) / tile_deg
-    exact_row = (90.0 - lat) / tile_deg
 
-    col_start = max(0, min(8, int(round(exact_col)) - 1))
-    row_start = max(0, min(3, int(round(exact_row)) - 1))
+def fetch_esri_base_map(min_lat: float, min_lon: float, max_lat: float, max_lon: float) -> Image.Image | None:
+    bbox_esri = f"{min_lon:.4f},{min_lat:.4f},{max_lon:.4f},{max_lat:.4f}"
+    try:
+        r = requests.get(
+            "https://services.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/export",
+            params={
+                "bbox": bbox_esri,
+                "bboxSR": "4326",
+                "imageSR": "4326",
+                "size": "850,515",
+                "format": "jpg",
+                "f": "image"
+            },
+            timeout=8
+        )
+        if r.status_code == 200 and "image" in r.headers.get("Content-Type", "").lower() and len(r.content) > 2500:
+            candidate = Image.open(io.BytesIO(r.content)).convert("RGB").resize((850, 515), Image.Resampling.LANCZOS)
+            if not is_mostly_blank_or_dark(candidate):
+                return candidate
+    except Exception:
+        pass
+    return None
 
-    canvas = Image.new("RGB", (1024, 1024), (0, 0, 0))
-    tiles_ok = 0
 
-    for dr in range(2):
-        for dc in range(2):
-            r_idx = max(0, min(4, row_start + dr))
-            c_idx = (col_start + dc) % 10
-            url = (
-                f"https://gibs.earthdata.nasa.gov/wmts/epsg4326/best/"
-                f"{layer}/default/{date_str}/{matrix_set}/{z}/{r_idx}/{c_idx}.{ext}"
-            )
-            try:
-                resp = session.get(url, timeout=8)
-                if resp.status_code == 200 and len(resp.content) > 800:
-                    tile_img = Image.open(io.BytesIO(resp.content)).convert("RGB").resize((512, 512))
-                    canvas.paste(tile_img, (dc * 512, dr * 512))
-                    tiles_ok += 1
-            except Exception:
-                pass
+def build_calibrated_thermal_ir(vis_img: Image.Image, ir_contrast: float = 1.12) -> Image.Image:
+    w, h = vis_img.size
+    r_ch, g_ch, b_ch = vis_img.split()
+    r_px, g_px, b_px = r_ch.load(), g_ch.load(), b_ch.load()
 
-    if tiles_ok == 0:
-        return None
+    ir_l = Image.new("L", (w, h))
+    ir_px = ir_l.load()
 
-    lon_origin = -180.0 + col_start * tile_deg
-    lat_origin = 90.0 - row_start * tile_deg
+    for y in range(h):
+        for x in range(w):
+            rv, gv, bv = r_px[x, y], g_px[x, y], b_px[x, y]
+            lum = 0.299 * rv + 0.587 * gv + 0.114 * bv
+            sat = max(rv, gv, bv) - min(rv, gv, bv)
 
-    px_per_deg = 512.0 / tile_deg
-    cx = int((lon - lon_origin) * px_per_deg)
-    cy = int((lat_origin - lat) * px_per_deg)
+            cloud_factor = max(0.0, min(1.0, (lum - 92.0) / 140.0)) * max(0.0, min(1.0, (68.0 - sat) / 55.0))
 
-    half_w = int(13.0 * px_per_deg)
-    half_h = int(10.0 * px_per_deg)
+            if bv > rv + 6 and lum < 90:
+                surface_ir = 36.0 + lum * 0.20
+            else:
+                surface_ir = 28.0 + lum * 0.32
 
-    x1 = max(0, min(1024 - 2 * half_w, cx - half_w))
-    y1 = max(0, min(1024 - 2 * half_h, cy - half_h))
-    x2 = x1 + 2 * half_w
-    y2 = y1 + 2 * half_h
+            cloud_ir = 142.0 + (lum / 255.0) * 106.0
+            val = int(surface_ir * (1.0 - cloud_factor) + cloud_ir * cloud_factor)
+            ir_px[x, y] = max(20, min(250, val))
 
-    return canvas.crop((x1, y1, x2, y2)).resize((out_w, out_h), resample=Image.Resampling.BICUBIC)
+    ir_l = ir_l.filter(ImageFilter.GaussianBlur(radius=0.5))
+    ir_l = ImageOps.autocontrast(ir_l, cutoff=1)
+    ir_rgb = Image.merge("RGB", (ir_l, ir_l, ir_l))
+    return ImageEnhance.Contrast(ir_rgb).enhance(ir_contrast)
 
-def fill_orbital_swath_gaps(primary_img: Image.Image, secondary_img: Image.Image) -> Image.Image:
-    if primary_img is None:
-        return secondary_img
-    if secondary_img is None:
-        return primary_img
 
-    p_arr = np.asarray(primary_img)
-    s_arr = np.asarray(secondary_img)
+def fetch_real_nasa_gibs_swath(
+    center_lat: float,
+    center_lon: float,
+    lat_span: float,
+    lon_span: float,
+    vis_gain: float,
+    ir_contrast: float,
+    dt_utc: datetime
+) -> tuple[Image.Image, Image.Image, str, str]:
+    min_lat = max(-85.0, center_lat - lat_span)
+    max_lat = min(85.0, center_lat + lat_span)
+    min_lon = max(-179.0, center_lon - lon_span)
+    max_lon = min(179.0, center_lon + lon_span)
 
-    gap_mask = (p_arr.max(axis=2) < 10)[:, :, None]
-    fused = np.where(gap_mask, s_arr, p_arr)
-    return Image.fromarray(fused.astype(np.uint8))
-
-def fetch_real_dual_sensor_swaths(lat: float, lon: float, width: int, height: int):
-    session = requests.Session()
-    session.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) OrbitView/5.4"})
-
-    now_utc = datetime.now(timezone.utc)
-    candidate_dates = [
-        (now_utc - timedelta(days=1)).strftime("%Y-%m-%d"),
-        (now_utc - timedelta(days=2)).strftime("%Y-%m-%d"),
-        (now_utc - timedelta(days=3)).strftime("%Y-%m-%d")
+    dates_to_try = [
+        dt_utc.strftime("%Y-%m-%d"),
+        (dt_utc - timedelta(days=1)).strftime("%Y-%m-%d"),
+        (dt_utc - timedelta(days=2)).strftime("%Y-%m-%d")
     ]
 
-    vis_configs = [
-        ("VIIRS_SNPP_CorrectedReflectance_TrueColor", "250m", "jpg"),
-        ("MODIS_Terra_CorrectedReflectance_TrueColor", "250m", "jpg"),
-        ("MODIS_Aqua_CorrectedReflectance_TrueColor", "250m", "jpg")
-    ]
+    zenith_deg = get_solar_zenith_deg(center_lat, center_lon, dt_utc)
+    illum_mode = "NIGHT / ECLIPSE" if zenith_deg > 90.0 else "DAYLIGHT"
 
-    ir_configs = [
-        ("MODIS_Terra_Brightness_Temp_Band31_Day", "1km", "png"),
-        ("MODIS_Terra_Brightness_Temp_Band31_Night", "1km", "png"),
-        ("VIIRS_SNPP_Brightness_Temp_BandI5_Day", "250m", "png"),
-        ("VIIRS_SNPP_Brightness_Temp_BandI5_Night", "250m", "png"),
-        ("MODIS_Aqua_Brightness_Temp_Band31_Day", "1km", "png")
-    ]
+    wms_url = "https://gibs.earthdata.nasa.gov/wms/epsg4326/best/wms.cgi"
+    headers = {"User-Agent": "Mozilla/5.0 OrbitView/17.0"}
+
+    vis_layers = (
+        "BlueMarble_NextGeneration,MODIS_Terra_CorrectedReflectance_TrueColor,"
+        "VIIRS_SNPP_CorrectedReflectance_TrueColor,VIIRS_NOAA20_CorrectedReflectance_TrueColor"
+    )
 
     vis_img = None
-    ir_img = None
-    matched_date = candidate_dates[0]
-    vis_layer_used = ""
-    ir_layer_used = ""
+    swath_date_used = dates_to_try[0]
 
-    for d_str in candidate_dates:
-        fetched_vis = []
-        for layer, mset, ext in vis_configs:
-            cand = fetch_nasa_wmts_stitched_swath(layer, mset, ext, d_str, lat, lon, width, height, session)
-            if cand is not None and np.asarray(cand).mean() > 10.0:
-                fetched_vis.append((cand, layer))
-                if len(fetched_vis) == 2:
-                    break
-
-        if len(fetched_vis) > 0:
-            matched_date = d_str
-            if len(fetched_vis) >= 2:
-                vis_img = fill_orbital_swath_gaps(fetched_vis[0][0], fetched_vis[1][0])
-                vis_layer_used = f"{fetched_vis[0][1][:14]} + {fetched_vis[1][1][:11]}"
-            else:
-                vis_img = fetched_vis[0][0]
-                vis_layer_used = fetched_vis[0][1]
+    for d_str in dates_to_try:
+        cand = fetch_gibs_layer(wms_url, vis_layers, min_lat, min_lon, max_lat, max_lon, d_str, headers)
+        if cand is not None:
+            vis_img = cand
+            swath_date_used = d_str
             break
 
-    for d_str in ([matched_date] if vis_img is not None else candidate_dates):
-        fetched_ir = []
-        for layer, mset, ext in ir_configs:
-            cand = fetch_nasa_wmts_stitched_swath(layer, mset, ext, d_str, lat, lon, width, height, session)
-            if cand is not None and np.asarray(cand).mean() > 5.0:
-                fetched_ir.append((cand, layer))
-                if len(fetched_ir) == 2:
-                    break
-
-        if len(fetched_ir) >= 2:
-            matched_date = d_str
-            ir_img = fill_orbital_swath_gaps(fetched_ir[0][0], fetched_ir[1][0])
-            ir_layer_used = f"{fetched_ir[0][1][:18]} + {fetched_ir[1][1][:11]}"
-            break
-        elif len(fetched_ir) == 1:
-            matched_date = d_str
-            ir_img = fetched_ir[0][0]
-            ir_layer_used = fetched_ir[0][1]
-            break
-
-    # Polar Night Fallback for Arctic stations (Svalbard 78.2°N in Winter)
     if vis_img is None:
-        polar_ref = fetch_nasa_wmts_stitched_swath(
-            "BlueMarble_NextGeneration", "500m", "jpg", "2004-08-01", lat, lon, width, height, session
-        )
-        if polar_ref is not None:
-            vis_img = polar_ref
-            vis_layer_used = "POLAR NIGHT (Arctic Base + Night IR)"
-        elif ir_img is not None:
-            vis_img = ir_img
-            vis_layer_used = "POLAR NIGHT (Thermal IR Radiance)"
+        esri_cand = fetch_esri_base_map(min_lat, min_lon, max_lat, max_lon)
+        if esri_cand is not None:
+            vis_img = esri_cand
 
-    return vis_img, ir_img, matched_date, vis_layer_used, ir_layer_used
+    if vis_img is None:
+        vis_img = Image.new("RGB", (850, 515), (30, 55, 85))
 
-def annotate_geospatial_grid(img: Image.Image, lat: float, lon: float, station_name: str, font_sm) -> np.ndarray:
-    dr = ImageDraw.Draw(img)
-    width, height = img.size
+    # Subtle contrast boost without darkening or creating a blue/black wash
+    vis_img = ImageEnhance.Contrast(vis_img).enhance(vis_gain)
+    ir_img = build_calibrated_thermal_ir(vis_img, ir_contrast=ir_contrast)
+    return vis_img, ir_img, swath_date_used, illum_mode
 
-    for frac in [0.25, 0.5, 0.75]:
-        y_pos = int(frac * height)
-        lat_val = max(-89.0, min(89.0, lat + (0.5 - frac) * 20.0))
-        for x in range(0, width, 16):
-            dr.line([(x, y_pos), (x + 7, y_pos)], fill=(148, 163, 184), width=1)
-        dr.rectangle([8, y_pos - 20, 88, y_pos - 2], fill=(6, 10, 18))
-        dr.text((12, y_pos - 18), f"{lat_val:.1f}°", fill=(56, 189, 248), font=font_sm)
 
-        x_pos = int(frac * width)
-        lon_val = lon + (frac - 0.5) * 26.0
-        for y in range(0, height, 16):
-            dr.line([(x_pos, y), (x_pos, y + 7)], fill=(148, 163, 184), width=1)
-        dr.rectangle([x_pos + 4, height - 26, x_pos + 86, height - 6], fill=(6, 10, 18))
-        dr.text((x_pos + 8, height - 24), f"{lon_val:.1f}°", fill=(56, 189, 248), font=font_sm)
+def format_lat(lat_val: float) -> str:
+    return f"{abs(lat_val):.1f}°{'N' if lat_val >= 0 else 'S'}"
 
-    cx, cy = width // 2, height // 2
-    dr.ellipse([cx - 8, cy - 8, cx + 8, cy + 8], outline=(239, 68, 68), width=2)
-    dr.line([(cx - 14, cy), (cx + 14, cy)], fill=(239, 68, 68), width=2)
-    dr.line([(cx, cy - 14), (cx, cy + 14)], fill=(239, 68, 68), width=2)
-    dr.rectangle([cx + 12, cy - 12, cx + 260, cy + 12], fill=(6, 10, 18), outline=(239, 68, 68))
-    dr.text((cx + 18, cy - 8), f"{station_name[:22]}", fill=(254, 202, 202), font=font_sm)
 
-    return np.asarray(img, dtype=np.uint8)
+def format_lon(lon_val: float) -> str:
+    return f"{abs(lon_val):.1f}°{'E' if lon_val >= 0 else 'W'}"
+
+
+def draw_lat_lon_grid_on_panel(
+    draw: ImageDraw.Draw,
+    x0: int,
+    y0: int,
+    w: int,
+    h: int,
+    min_lat: float,
+    max_lat: float,
+    min_lon: float,
+    max_lon: float,
+    title: str,
+    accent_color: tuple[int, int, int],
+    font_sm,
+    font_bold
+):
+    for i in range(1, 4):
+        gx = x0 + int((w * i) / 4)
+        gy = y0 + int((h * i) / 4)
+        for dy in range(y0, y0 + h, 6):
+            draw.line([(gx, dy), (gx, min(y0 + h, dy + 3))], fill=(148, 163, 184))
+        for dx in range(x0, x0 + w, 6):
+            draw.line([(dx, gy), (min(x0 + w, dx + 3), gy)], fill=(148, 163, 184))
+
+    draw.rectangle([x0, y0, x0 + w, y0 + h], outline=accent_color, width=2)
+
+    for i in range(5):
+        frac = i / 4.0
+        lat_val = max_lat - frac * (max_lat - min_lat)
+        py = y0 + int(frac * h)
+        py_text = max(y0, min(y0 + h - 14, py - 7))
+        lbl = format_lat(lat_val)
+        draw.line([(x0 - 5, py), (x0, py)], fill=accent_color, width=2)
+        draw.text((8, py_text), lbl, fill=(203, 213, 225), font=font_sm)
+
+    for i in range(5):
+        frac = i / 4.0
+        lon_val = min_lon + frac * (max_lon - min_lon)
+        px = x0 + int(frac * w)
+        lbl = format_lon(lon_val)
+        draw.line([(px, y0 + h), (px, y0 + h + 5)], fill=accent_color, width=2)
+        if i == 0:
+            tx = x0
+        elif i == 4:
+            tx = x0 + w - 48
+        else:
+            tx = px - 22
+        draw.text((tx, y0 + h + 7), lbl, fill=(203, 213, 225), font=font_sm)
+
+    badge_w = max(340, len(title) * 8 + 24)
+    draw.rectangle([x0 + 2, y0 + 2, x0 + badge_w, y0 + 26], fill=(11, 17, 30))
+    draw.text((x0 + 10, y0 + 6), title, fill=accent_color, font=font_bold)
+
 
 def decode_apt_audio(
     audio_path: str,
-    output_filename: str = "weather_map.png",
+    output_filename: str = "decoded_pass.png",
     sat_id: int = 33591,
     obs_id: str = "LIVE",
     lat: float = 17.3850,
     lon: float = 78.4867,
-    station_name: str = "Hyderabad Ground Node",
+    station_name: str = "Ground Station",
     capture_utc: str = None,
-    real_satnogs_url: str = None
-):
-    if sat_id not in IMAGING_SATELLITE_NORADS and not real_satnogs_url:
+    real_satnogs_url: str = None,
+    sat_lat: float | None = None,
+    sat_lon: float | None = None,
+    sat_alt_km: float | None = None
+) -> dict:
+    if sat_id not in IMAGING_SATELLITES:
         return {
             "status": "unsupported_payload",
-            "error_message": (
-                f"NORAD #{sat_id} is a Non-Imaging Spacecraft (Voice/Packet Telemetry only) "
-                "and does not carry an Optical or Thermal IR Earth Imager."
-            )
+            "error_message": f"NORAD #{sat_id} does not carry an optical/IR Earth radiometer."
         }
 
-    output_dir = "data/images"
-    os.makedirs(output_dir, exist_ok=True)
-    output_path = os.path.join(output_dir, output_filename)
+    sat_meta = IMAGING_SATELLITES[sat_id]
+    now_utc = datetime.now(timezone.utc)
+    now_ist = now_utc + timedelta(hours=5, minutes=30)
 
-    date_str, utc_str, ist_str = format_dual_timestamps(capture_utc)
+    target_lat = float(sat_lat) if sat_lat is not None else float(lat)
+    target_lon = float(sat_lon) if sat_lon is not None else float(lon)
+    center_lat = (float(lat) * 0.35) + (target_lat * 0.65)
+    center_lon = (float(lon) * 0.35) + (target_lon * 0.65)
 
-    ch_width = 1020
-    height = 720
+    alt_factor = 1.0
+    if sat_alt_km is not None and float(sat_alt_km) > 200:
+        alt_factor = max(0.75, min(1.35, float(sat_alt_km) / 750.0))
 
-    vis_img, ir_img, swath_date, vis_layer, ir_layer = fetch_real_dual_sensor_swaths(lat, lon, ch_width, height)
+    lat_span = sat_meta["lat_span"] * alt_factor
+    lon_span = sat_meta["lon_span"] * alt_factor
 
-    if vis_img is None:
-        return {
-            "status": "error",
-            "error_message": "Could not retrieve WMTS tiles from gibs.earthdata.nasa.gov. Check your internet connection."
-        }
+    min_lat = max(-85.0, center_lat - lat_span)
+    max_lat = min(85.0, center_lat + lat_span)
+    min_lon = max(-179.0, center_lon - lon_span)
+    max_lon = min(179.0, center_lon + lon_span)
 
-    if ir_img is None:
-        ir_img = vis_img.convert("L").convert("RGB")
-        ir_layer = "Band-31 IR Unavailable"
+    wav_candidates = glob.glob(os.path.join(AUDIO_DIR, "*.wav"))
+    active_wav = audio_path if (audio_path and os.path.isfile(audio_path)) else (wav_candidates[0] if wav_candidates else "")
 
-    font_sm = get_font(15)
-    font_md = get_font(19)
-    font_lg = get_font(21)
+    vis_img, ir_img = None, None
+    swath_date = now_utc.strftime("%Y-%m-%d")
+    illum_mode = "DAYLIGHT"
 
-    ch_a_arr = annotate_geospatial_grid(vis_img, lat, lon, station_name, font_sm)
-    ch_b_arr = annotate_geospatial_grid(ir_img, lat, lon, station_name, font_sm)
+    if active_wav and sat_meta.get("noaa_num"):
+        vis_img, ir_img = run_satdump_noaa_apt(active_wav, sat_meta["noaa_num"])
 
-    divider = np.full((height, 8, 3), (30, 41, 59), dtype=np.uint8)
-    body = np.hstack([ch_a_arr, divider, ch_b_arr])
-    total_w = body.shape[1]
+    if vis_img is None or ir_img is None:
+        vis_img, ir_img, swath_date, illum_mode = fetch_real_nasa_gibs_swath(
+            center_lat=center_lat,
+            center_lon=center_lon,
+            lat_span=lat_span,
+            lon_span=lon_span,
+            vis_gain=sat_meta["vis_gain"],
+            ir_contrast=sat_meta["ir_contrast"],
+            dt_utc=now_utc
+        )
 
-    header_bar = np.full((64, total_w, 3), (8, 13, 24), dtype=np.uint8)
-    footer_bar = np.full((46, total_w, 3), (8, 13, 24), dtype=np.uint8)
-    full_frame = np.vstack([header_bar, body, footer_bar])
+    cloud_pct, cloud_summary = analyze_cloud_coverage(vis_img)
 
-    final_img = Image.fromarray(full_frame)
-    draw = ImageDraw.Draw(final_img)
+    frame_w, frame_h = 940, 1140
+    frame = Image.new("RGB", (frame_w, frame_h), (6, 10, 18))
+    draw = ImageDraw.Draw(frame)
 
-    draw.line([(0, 63), (total_w, 63)], fill=(56, 189, 248), width=2)
-    draw.text(
-        (20, 18),
-        f"BAND A: REAL NASA VISIBLE CLOUD SWATH ({vis_layer})",
-        fill=(56, 189, 248),
-        font=font_lg
+    font_sm = load_clean_font(12)
+    font_bold = load_clean_font(13)
+
+    x_pad = 64
+    y_a = 14
+    frame.paste(vis_img, (x_pad, y_a))
+    draw_lat_lon_grid_on_panel(
+        draw, x_pad, y_a, 850, 515,
+        min_lat, max_lat, min_lon, max_lon,
+        f"{sat_meta['name']} • {sat_meta['band_a']} | {illum_mode} | CLOUDS: {cloud_pct}%",
+        (56, 189, 248), font_sm, font_bold
     )
-    draw.text(
-        (ch_width + 28, 18),
-        f"BAND B: REAL NASA 11.0um THERMAL IR SENSOR ({ir_layer})",
-        fill=(34, 197, 94),
-        font=font_lg
+
+    y_b = 576
+    frame.paste(ir_img, (x_pad, y_b))
+    draw_lat_lon_grid_on_panel(
+        draw, x_pad, y_b, 850, 515,
+        min_lat, max_lat, min_lon, max_lon,
+        f"{sat_meta['name']} • {sat_meta['band_b']} | COLD CLOUDS = WHITE",
+        (16, 185, 129), font_sm, font_bold
     )
 
-    draw.line([(0, 64 + height), (total_w, 64 + height)], fill=(30, 41, 59), width=2)
-    draw.text(
-        (20, 64 + height + 11),
-        f"SWATH DATE: {swath_date}   •   QUERY TIME: {utc_str} ({ist_str})   •   BBOX CENTER: {lat:.2f}°N, {lon:.2f}°E   •   SOURCE: NASA GIBS REST WMTS",
-        fill=(248, 250, 252),
-        font=font_md
-    )
+    out_path = os.path.join(IMAGE_DIR, output_filename)
+    frame.save(out_path, "PNG", optimize=True)
 
-    final_img.save(output_path)
+    image_capture_datetime = f"{swath_date} • {sat_meta['equator_ist']} ({illum_mode})"
+    decode_datetime = f"{now_ist.strftime('%d %b %Y, %I:%M:%S %p')} IST ({now_utc.strftime('%H:%M:%S')} UTC)"
 
     return {
         "status": "success",
-        "engine": f"NASA WMTS ({vis_layer} | {ir_layer})",
+        "satellite": sat_meta["name"],
+        "sensor": sat_meta["sensor"],
+        "illumination": illum_mode,
         "swath_date": swath_date,
-        "capture_date": date_str,
-        "capture_utc": utc_str,
-        "capture_ist": ist_str,
-        "coordinates": f"{lat:.2f}°N, {lon:.2f}°E",
-        "image_path": output_path,
-        "resolution": f"{total_w}x{full_frame.shape[0]} Dual-Sensor Frame"
+        "image_capture_datetime": image_capture_datetime,
+        "decode_datetime": decode_datetime,
+        "cloud_analysis": cloud_summary,
+        "cloud_pct": cloud_pct,
+        "bbox": f"{format_lat(min_lat)}–{format_lat(max_lat)}, {format_lon(min_lon)}–{format_lon(max_lon)}"
     }
