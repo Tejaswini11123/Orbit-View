@@ -30,6 +30,7 @@ VERIFIED_ORBITS = {
     44878: ("OPS-SAT (ESA)", 97.4610, 260.8010, "0010500", 154.1010, 206.0010, 15.18920192),
 }
 
+
 def fix_tle_checksum(line_68: str) -> str:
     line_68 = line_68[:68].ljust(68)
     cksum = 0
@@ -39,6 +40,7 @@ def fix_tle_checksum(line_68: str) -> str:
         elif ch == "-":
             cksum += 1
     return f"{line_68}{cksum % 10}"
+
 
 def build_clean_tle(sat_id: int) -> tuple[str, str, str]:
     """Builds a mathematically pure, zero-drag 69-char NORAD TLE anchored to the current year."""
@@ -55,10 +57,11 @@ def build_clean_tle(sat_id: int) -> tuple[str, str, str]:
     l2_68 = f"2 {sat_id:05d} {inc:8.4f} {raan:8.4f} {ecc:7s} {argp:8.4f} {ma:8.4f} {mm:11.8f}10000"
     return name, fix_tle_checksum(l1_68), fix_tle_checksum(l2_68)
 
+
 def is_orbit_physically_sane(sat: EarthSatellite, now_utc: datetime) -> bool:
     """
     Tests the satellite object across 10 minutes.
-    Rejects any TLE that has decayed, has NaN coordinates, or moves > 45 deg latitude in 2 minutes.
+    Rejects any TLE that has decayed, has NaN coordinates, or moves > 18 deg latitude in 2 minutes.
     """
     try:
         t0 = ts.from_datetime(now_utc)
@@ -73,7 +76,6 @@ def is_orbit_physically_sane(sat: EarthSatellite, now_utc: datetime) -> bool:
 
         if math.isnan(lat0) or math.isnan(lon0) or math.isnan(alt0) or math.isnan(lat1):
             return False
-        # Healthy LEO satellite is between 250 km and 2000 km altitude and moves ~7 deg lat in 2 mins
         if alt0 < 220.0 or alt0 > 2500.0:
             return False
         if abs(lat1 - lat0) > 18.0:
@@ -81,6 +83,7 @@ def is_orbit_physically_sane(sat: EarthSatellite, now_utc: datetime) -> bool:
         return True
     except Exception:
         return False
+
 
 def get_healthy_satellite(sat_id: int, now_utc: datetime) -> tuple[str, str, str, EarthSatellite]:
     """Fetches TLE and verifies its physical sanity; falls back to clean synthetic TLE if decayed/corrupted."""
@@ -120,6 +123,7 @@ def get_healthy_satellite(sat_id: int, now_utc: datetime) -> tuple[str, str, str
     name, l1, l2 = build_clean_tle(sat_id)
     sat = EarthSatellite(l1, l2, name, ts)
     return name, l1, l2, sat
+
 
 def compute_point_telemetry(sat: EarthSatellite, observer, t, base_freq_mhz: float) -> dict:
     diff = sat - observer
@@ -163,6 +167,7 @@ def compute_point_telemetry(sat: EarthSatellite, observer, t, base_freq_mhz: flo
         "sat_alt_km": round(alt_km, 1)
     }
 
+
 def compute_ground_track(sat: EarthSatellite, now_utc: datetime) -> list[dict]:
     """
     Computes exactly ONE clean orbital revolution (-20 mins to +75 mins) at 60-second intervals.
@@ -186,6 +191,7 @@ def compute_ground_track(sat: EarthSatellite, now_utc: datetime) -> list[dict]:
                 "is_past": dt < now_utc
             })
     return track
+
 
 def get_upcoming_passes(
     sat_id: int = 33591,
@@ -248,5 +254,6 @@ def get_upcoming_passes(
         "ground_track": ground_track,
         "passes": passes
     }
+
 
 calculate_pass_trajectory = get_upcoming_passes

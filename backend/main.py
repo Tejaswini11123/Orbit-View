@@ -20,9 +20,11 @@ app.add_middleware(
 os.makedirs("data/images", exist_ok=True)
 app.mount("/images", StaticFiles(directory="data/images"), name="images")
 
+
 @app.get("/api/stations")
 def api_stations():
     return get_active_ground_stations()
+
 
 @app.get("/api/passes")
 def api_passes(
@@ -41,12 +43,16 @@ def api_passes(
         base_freq_mhz=freq
     )
 
+
 @app.post("/api/process-pass")
 def api_process_pass(
     sat_id: int = Query(33591),
     lat: float = Query(17.3850),
     lon: float = Query(78.4867),
-    station_name: str = Query("Hyderabad Ground Node")
+    station_name: str = Query("Hyderabad Ground Node"),
+    sat_lat: float | None = Query(None),
+    sat_lon: float | None = Query(None),
+    sat_alt_km: float | None = Query(None)
 ):
     obs_meta = fetch_latest_observation_audio(sat_id=sat_id)
     out_filename = f"swath_{sat_id}_{int(abs(lat)*10)}_{int(abs(lon)*10)}.png"
@@ -60,7 +66,10 @@ def api_process_pass(
         lon=lon,
         station_name=station_name,
         capture_utc=obs_meta.get("capture_utc"),
-        real_satnogs_url=obs_meta.get("real_satnogs_image")
+        real_satnogs_url=obs_meta.get("real_satnogs_image"),
+        sat_lat=sat_lat,
+        sat_lon=sat_lon,
+        sat_alt_km=sat_alt_km
     )
 
     image_url = f"/images/{out_filename}?t={os.urandom(4).hex()}" if decode_res.get("status") == "success" else None
