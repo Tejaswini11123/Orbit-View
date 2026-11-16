@@ -5,6 +5,7 @@ import glob
 import shutil
 import subprocess
 from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 import requests
 from PIL import Image, ImageDraw, ImageOps, ImageEnhance, ImageFont, ImageFilter
 
@@ -177,24 +178,65 @@ def run_satdump_noaa_apt(audio_file: str, noaa_num: str) -> tuple[Image.Image | 
     return None, None
 
 
-def get_solar_zenith_deg(lat: float, lon: float, dt_utc: datetime) -> float:
+def get_solar_illumination(lat: float, lon: float, dt_utc: datetime) -> dict:
+    """Computes solar elevation & illumination status for any (lat, lon) at dt_utc."""
+    if dt_utc.tzinfo is None:
+        dt_utc = dt_utc.replace(tzinfo=timezone.utc)
+    else:
+        dt_utc = dt_utc.astimezone(timezone.utc)
+
     start_of_year = datetime(dt_utc.year, 1, 1, tzinfo=timezone.utc)
-    day_of_year = (dt_utc - start_of_year).total_seconds() / 86400.0
+    day_of_year = (dt_utc - start_of_year).total_seconds() / 86400.0 + 1.0
     utc_hours = dt_utc.hour + dt_utc.minute / 60.0 + dt_utc.second / 3600.0
 
     gamma = (2.0 * math.pi / 365.25) * (day_of_year - 81.0)
-    decl_rad = math.radians(23.44 * math.sin(gamma))
-    eq_time_min = 9.87 * math.sin(2 * gamma) - 7.53 * math.cos(gamma) - 1.5 * math.sin(gamma)
-    solar_time_hr = (utc_hours + lon / 15.0 + eq_time_min / 60.0) % 24.0
-    hour_angle_rad = math.radians((solar_time_hr - 12.0) * 15.0)
+    sun_decl_deg = 23.44 * math.sin(gamma)
+    eq_time_min = 9.87 * math.sin(2.0 * gamma) - 7.53 * math.cos(gamma) - 1.5 * math.sin(gamma)
+
+    sun_lon_deg = (12.0 - utc_hours) * 15.0 - eq_time_min * 0.25
+    sun_lon_deg = ((sun_lon_deg + 540.0) % 360.0) - 180.0
 
     lat_rad = math.radians(lat)
-    cos_zenith = (
+    decl_rad = math.radians(sun_decl_deg)
+    dlon_rad = math.radians(lon - sun_lon_deg)
+
+    sin_elev = (
         math.sin(lat_rad) * math.sin(decl_rad)
-        + math.cos(lat_rad) * math.cos(decl_rad) * math.cos(hour_angle_rad)
+        + math.cos(lat_rad) * math.cos(decl_rad) * math.cos(dlon_rad)
     )
-    cos_zenith = max(-1.0, min(1.0, cos_zenith))
-    return math.degrees(math.acos(cos_zenith))
+    sin_elev = max(-1.0, min(1.0, sin_elev))
+    solar_elev_deg = math.degrees(math.asin(sin_elev))
+    zenith_deg = 90.0 - solar_elev_deg
+
+    if solar_elev_deg > 0.0:
+        status = "DAYLIGHT"
+    elif solar_elev_deg >= -6.0:
+        status = "TWILIGHT"
+    else:
+        status = "NIGHT / ECLIPSE"
+
+    return {
+        "status": status,
+        "solar_elevation_deg": round(solar_elev_deg, 2),
+        "zenith_deg": round(zenith_deg, 2),
+    }
+
+
+def get_solar_zenith_deg(lat: float, lon: float, dt_utc: datetime) -> float:
+    return get_solar_illumination(lat, lon, dt_utc)["zenith_deg"]
+
+
+def parse_capture_dt_utc(capture_utc: str | None, fallback_utc: datetime) -> datetime:
+    if not capture_utc:
+        return fallback_utc
+    try:
+        cleaned = capture_utc.strip().replace("Z", "+00:00")
+        parsed = datetime.fromisoformat(cleaned)
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    except Exception:
+        return fallback_utc
 
 
 def analyze_cloud_coverage(vis_img: Image.Image) -> tuple[float, str]:
@@ -344,8 +386,7 @@ def fetch_real_nasa_gibs_swath(
         (dt_utc - timedelta(days=2)).strftime("%Y-%m-%d")
     ]
 
-    zenith_deg = get_solar_zenith_deg(center_lat, center_lon, dt_utc)
-    illum_mode = "NIGHT / ECLIPSE" if zenith_deg > 90.0 else "DAYLIGHT"
+    illum_mode = get_solar_illumination(center_lat, center_lon, dt_utc)["status"]
 
     wms_url = "https://gibs.earthdata.nasa.gov/wms/epsg4326/best/wms.cgi"
     headers = {"User-Agent": "Mozilla/5.0 OrbitView/17.0"}
@@ -373,7 +414,6 @@ def fetch_real_nasa_gibs_swath(
     if vis_img is None:
         vis_img = Image.new("RGB", (850, 515), (30, 55, 85))
 
-    # Subtle contrast boost without darkening or creating a blue/black wash
     vis_img = ImageEnhance.Contrast(vis_img).enhance(vis_gain)
     ir_img = build_calibrated_thermal_ir(vis_img, ir_contrast=ir_contrast)
     return vis_img, ir_img, swath_date_used, illum_mode
@@ -462,12 +502,14 @@ def decode_apt_audio(
 
     sat_meta = IMAGING_SATELLITES[sat_id]
     now_utc = datetime.now(timezone.utc)
-    now_ist = now_utc + timedelta(hours=5, minutes=30)
+    ist_tz = ZoneInfo("Asia/Kolkata")
+    now_ist = now_utc.astimezone(ist_tz)
+    swath_dt_utc = parse_capture_dt_utc(capture_utc, now_utc)
+    swath_dt_ist = swath_dt_utc.astimezone(ist_tz)
 
-    target_lat = float(sat_lat) if sat_lat is not None else float(lat)
-    target_lon = float(sat_lon) if sat_lon is not None else float(lon)
-    center_lat = (float(lat) * 0.35) + (target_lat * 0.65)
-    center_lon = (float(lon) * 0.35) + (target_lon * 0.65)
+    # Center swath directly on the selected ground station node
+    center_lat = float(lat)
+    center_lon = float(lon)
 
     alt_factor = 1.0
     if sat_alt_km is not None and float(sat_alt_km) > 200:
@@ -485,8 +527,8 @@ def decode_apt_audio(
     active_wav = audio_path if (audio_path and os.path.isfile(audio_path)) else (wav_candidates[0] if wav_candidates else "")
 
     vis_img, ir_img = None, None
-    swath_date = now_utc.strftime("%Y-%m-%d")
-    illum_mode = "DAYLIGHT"
+    swath_date = swath_dt_utc.strftime("%Y-%m-%d")
+    illum_mode = get_solar_illumination(center_lat, center_lon, swath_dt_utc)["status"]
 
     if active_wav and sat_meta.get("noaa_num"):
         vis_img, ir_img = run_satdump_noaa_apt(active_wav, sat_meta["noaa_num"])
@@ -499,7 +541,7 @@ def decode_apt_audio(
             lon_span=lon_span,
             vis_gain=sat_meta["vis_gain"],
             ir_contrast=sat_meta["ir_contrast"],
-            dt_utc=now_utc
+            dt_utc=swath_dt_utc
         )
 
     cloud_pct, cloud_summary = analyze_cloud_coverage(vis_img)
@@ -533,7 +575,10 @@ def decode_apt_audio(
     out_path = os.path.join(IMAGE_DIR, output_filename)
     frame.save(out_path, "PNG", optimize=True)
 
-    image_capture_datetime = f"{swath_date} • {sat_meta['equator_ist']} ({illum_mode})"
+    image_capture_datetime = (
+        f"{swath_dt_ist.strftime('%Y-%m-%d • %H:%M')} IST "
+        f"({swath_dt_utc.strftime('%H:%M')} UTC) ({illum_mode})"
+    )
     decode_datetime = f"{now_ist.strftime('%d %b %Y, %I:%M:%S %p')} IST ({now_utc.strftime('%H:%M:%S')} UTC)"
 
     return {
