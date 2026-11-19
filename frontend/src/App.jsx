@@ -1,6 +1,6 @@
 ﻿import React, { useState, useEffect, useRef } from "react";
 
-const API_BASE = "http://127.0.0.1:8000";
+const API_BASE = "https://orbit-vieww-api.onrender.com";
 
 const SATELLITE_CATALOG = [
   { id: 33591, name: "NOAA 19", category: "Weather", freq: 137.100, mode: "AVHRR APT", hasImager: true },
