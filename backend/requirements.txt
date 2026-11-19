@@ -4,3 +4,4 @@ skyfield==1.46
 requests==2.31.0
 pydantic==2.6.4
 tzdata
+numpy==1.26.4
